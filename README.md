@@ -52,9 +52,12 @@ Check yours with `lsusb | grep 1532`. Other BlackShark models use different prot
 - PipeWire with `pactl` and `parec` (`pulseaudio-utils` on Fedora)
 - [EasyEffects](https://github.com/wwmm/easyeffects) 7.x, the native (non-Flatpak) build, for voice enhancement
 - The Calf LV2 plugins (`calf-plugins`). The installer adds these on Debian, Ubuntu and Mint.
-- A tray icon needs Cinnamon (XApp), or a desktop with AppIndicator support. Without one, the app opens as a normal window.
+- A tray icon works on KDE Plasma (native StatusNotifierItem), Cinnamon (XApp), and desktops with AppIndicator support. Without one, the app opens as a normal window.
+- Optional: `gtk-layer-shell` on Wayland, so the tray quick panel opens next to the Plasma panel instead of wherever the compositor chooses.
 
-Tested on Linux Mint 22.3 (Cinnamon), PipeWire 1.0.5, EasyEffects 7.1.6, headset firmware 2.5.
+On Arch and Manjaro, the GTK/PyGObject pieces are `python-gobject` and `gtk3`; `gtk-layer-shell` is optional.
+
+Tested on Linux Mint 22.3 (Cinnamon), PipeWire 1.0.5, EasyEffects 7.1.6, headset firmware 2.5. KDE Plasma 6 on Wayland uses the native StatusNotifierItem tray backend and needs no extra tray package.
 
 ## Install
 
@@ -71,7 +74,7 @@ Run it as your normal user. It asks for sudo only to:
 
 Everything else goes into your home folder.
 
-Then open **BlackShark Control** from the menu. It also starts in the tray at login.
+Then open **BlackShark Control** from the menu. It also starts in the tray at login. On KDE Plasma, the tray icon appears in the system tray: left-click opens the quick panel, right-click shows Open and Quit.
 
 With voice enhancement on, apps record from **Easy Effects Source**, which the app sets as your default input. In Discord, Zoom or OBS, pick "Default" or "Easy Effects Source", and turn off the app's own noise suppression so the two don't stack.
 
@@ -99,6 +102,7 @@ The protocol (framing, command IDs and the EQ apply sequences) was reverse-engin
 | `blackshark/protocol.py` | Headset protocol over hidraw |
 | `blackshark/audio.py` | PipeWire and EasyEffects: profiles, volumes, mic presets |
 | `blackshark/gui.py` | GTK 3 window, tray quick panel, background worker |
+| `blackshark/tray.py` | StatusNotifierItem + DBusMenu tray backend for KDE Plasma |
 | `blackshark/widgets.py` | Cairo-drawn battery ring, EQ curve, waveform |
 | `blackshark/cli.py` | `blackshark-ctl` |
 

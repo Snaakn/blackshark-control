@@ -58,6 +58,11 @@ def set_icon(img, name, size=16, color="#f2f2f4", stroke=2.0):
     img.set_from_surface(surface)
 
 
+def icon_pixbuf(name, px, color="#f2f2f4", stroke=2.0):
+    """A pixbuf version of one of the stroke icons, for tray/DBus use."""
+    return _icon_pixbuf(name, px, color, stroke)
+
+
 def _icon_pixbuf(name, px, color, stroke):
     body = ICONS[name].replace("currentColor", color)
     svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{px}" height="{px}" viewBox="0 0 24 24" '

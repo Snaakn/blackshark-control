@@ -5,6 +5,7 @@ import json
 import math
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -26,9 +27,15 @@ try:
     from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 except (ValueError, ImportError):
     AppIndicator = None
+try:
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import GtkLayerShell as LayerShell  # noqa: E402
+except (ValueError, ImportError):
+    LayerShell = None
 
 from . import audio  # noqa: E402
 from . import protocol as P  # noqa: E402
+from .tray import StatusNotifierItem  # noqa: E402
 from .widgets import BatteryRing, EqCurve, ModeWave, Pulse, Waveform, icon  # noqa: E402
 
 CONFIG = os.path.expanduser("~/.config/blackshark-control/settings.json")
@@ -75,6 +82,60 @@ def shade(hex_color, f):
     h = hex_color.lstrip("#")
     r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
     return "#{:02x}{:02x}{:02x}".format(*(min(255, round(c * f)) for c in (r, g, b)))
+
+
+def is_kde():
+    desktop = (os.environ.get("XDG_CURRENT_DESKTOP", "") + ":" +
+               os.environ.get("XDG_SESSION_DESKTOP", "")).lower()
+    return ("kde" in desktop or "plasma" in desktop or
+            bool(os.environ.get("KDE_FULL_SESSION")) or
+            bool(os.environ.get("KDE_SESSION_VERSION")))
+
+
+def is_wayland():
+    display = Gdk.Display.get_default()
+    if display is not None:
+        return "wayland" in type(display).__name__.lower()
+    return bool(os.environ.get("WAYLAND_DISPLAY") or
+                os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland")
+
+
+PLASMA_APPLETSRC = os.path.expanduser("~/.config/plasma-org.kde.plasma.desktop-appletsrc")
+PANEL_LOCATIONS = {3: Gtk.PositionType.TOP, 4: Gtk.PositionType.BOTTOM,
+                   5: Gtk.PositionType.LEFT, 6: Gtk.PositionType.RIGHT}
+
+
+def plasma_panel():
+    """Best-effort location and thickness of the Plasma panel, for popup placement."""
+    try:
+        with open(PLASMA_APPLETSRC) as f:
+            lines = f.readlines()
+    except OSError:
+        return Gtk.PositionType.BOTTOM, 44
+    panels = []
+    current = None
+    for line in lines:
+        line = line.strip()
+        if re.match(r"^\[Containments\]\[\d+\]$", line):
+            current = {}
+            panels.append(current)
+        elif line.startswith("["):
+            current = None
+        elif current is not None and "=" in line:
+            key, value = line.split("=", 1)
+            current[key] = value
+    for p in panels:
+        loc = p.get("location", "")
+        if p.get("plugin") != "org.kde.panel" or not loc.isdigit():
+            continue
+        if int(loc) not in PANEL_LOCATIONS:
+            continue
+        try:
+            thickness = int(p.get("thickness", "44"))
+        except ValueError:
+            thickness = 44
+        return PANEL_LOCATIONS[int(loc)], thickness
+    return Gtk.PositionType.BOTTOM, 44
 
 
 CSS = """
@@ -1125,6 +1186,7 @@ class QuickPanel(Gtk.Window):
         root.pack_start(vbox(8, label("Equalizer", "sectlabel"), chips), False, False, 0)
         root.show_all()
         self._last_side = 5
+        self._layer_ready = False
 
     def _toggle_side(self, _):
         self.ctl.set_sidetone(0 if self.ctl.state["sidetone"] else self._last_side)
@@ -1149,7 +1211,31 @@ class QuickPanel(Gtk.Window):
         for key, b in self.preset_btns.items():
             set_class(b, "on", key == s["preset"])
 
-    def popup_at(self, x, y, panel_pos):
+    def popup_from_tray(self, panel_pos=None, thickness=0):
+        """Open next to the panel; used by the Plasma tray, which has no pointer coords."""
+        if panel_pos is None:
+            panel_pos, thickness = plasma_panel()
+        nat = self.get_preferred_size()[1]
+        w, h = nat.width, nat.height
+        display = Gdk.Display.get_default()
+        mon = display.get_primary_monitor()
+        wa = mon.get_workarea() if mon else Gdk.Rectangle()
+        if panel_pos in (Gtk.PositionType.TOP, Gtk.PositionType.BOTTOM):
+            x = wa.x + wa.width - w // 2 - 12
+            y = wa.y if panel_pos == Gtk.PositionType.TOP else wa.y + wa.height
+        else:
+            x = wa.x if panel_pos == Gtk.PositionType.LEFT else wa.x + wa.width
+            y = wa.y + h // 2 + 12
+        self.popup_at(x, y, panel_pos, thickness)
+
+    def popup_at(self, x, y, panel_pos, panel_thickness=0):
+        if is_wayland():
+            # Wayland ignores gtk_window_move(); the compositor owns placement.
+            # gtk-layer-shell (when installed) gives us a real screen-edge popup.
+            self._place_wayland(panel_pos, panel_thickness)
+            self.show_all()
+            self.present_with_time(Gtk.get_current_event_time())
+            return
         self.show_all()
         nat = self.get_preferred_size()[1]
         w, h = nat.width, nat.height
@@ -1174,6 +1260,45 @@ class QuickPanel(Gtk.Window):
         self.move(px, py)
         self.present_with_time(Gtk.get_current_event_time())
 
+    def _place_wayland(self, panel_pos, thickness):
+        if LayerShell is None or not LayerShell.is_supported():
+            return False
+        if not self._layer_ready:
+            if self.get_realized():
+                return False
+            LayerShell.init_for_window(self)
+            LayerShell.set_namespace(self, "blackshark-control")
+            LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+            LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.ON_DEMAND)
+            self._layer_ready = True
+        edges = (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM,
+                 LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT)
+        for edge in edges:
+            LayerShell.set_anchor(self, edge, False)
+            LayerShell.set_margin(self, edge, 0)
+        gap = max(0, thickness) + 8
+        if panel_pos == Gtk.PositionType.TOP:
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.RIGHT, True)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP, gap)
+            LayerShell.set_margin(self, LayerShell.Edge.RIGHT, 8)
+        elif panel_pos == Gtk.PositionType.LEFT:
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.LEFT, True)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP, 8)
+            LayerShell.set_margin(self, LayerShell.Edge.LEFT, gap)
+        elif panel_pos == Gtk.PositionType.RIGHT:
+            LayerShell.set_anchor(self, LayerShell.Edge.TOP, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.RIGHT, True)
+            LayerShell.set_margin(self, LayerShell.Edge.TOP, 8)
+            LayerShell.set_margin(self, LayerShell.Edge.RIGHT, gap)
+        else:  # bottom, the Plasma default
+            LayerShell.set_anchor(self, LayerShell.Edge.BOTTOM, True)
+            LayerShell.set_anchor(self, LayerShell.Edge.RIGHT, True)
+            LayerShell.set_margin(self, LayerShell.Edge.BOTTOM, gap)
+            LayerShell.set_margin(self, LayerShell.Edge.RIGHT, 8)
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Tray icon
@@ -1182,6 +1307,19 @@ class QuickPanel(Gtk.Window):
 class Tray:
     def __init__(self, ctl, panel, open_main, quit_):
         self.ctl, self.panel = ctl, panel
+        self.open_main = open_main
+        self.icon = None
+        self.ind = None
+        self.sni = None
+        # Plasma speaks StatusNotifierItem natively; prefer that to a missing
+        # libayatana-appindicator. XApp/AppIndicator remain the Cinnamon path.
+        if is_kde() or not (XApp or AppIndicator):
+            try:
+                self.sni = StatusNotifierItem(self._activate, self._open_main, quit_)
+            except Exception as e:
+                print("tray: StatusNotifierItem unavailable:", e, file=sys.stderr)
+        if self.sni:
+            return
         menu = Gtk.Menu()
         o = Gtk.MenuItem(label="Open BlackShark Control")
         o.connect("activate", lambda *_: open_main())
@@ -1190,8 +1328,6 @@ class Tray:
         menu.append(o)
         menu.append(q)
         menu.show_all()
-        self.icon = None
-        self.ind = None
         if XApp:
             self.icon = XApp.StatusIcon()
             self.icon.set_name("blackshark-control")
@@ -1204,6 +1340,25 @@ class Tray:
             self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
             self.ind.set_menu(menu)
 
+    @property
+    def available(self):
+        return bool(self.sni or self.icon or self.ind)
+
+    def _activate(self, _x, _y, token=None):
+        if self.panel.get_visible():
+            self.panel.hide()
+        else:
+            # Plasma supplies an XDG activation token so the popup may take
+            # focus on Wayland under its focus-stealing protection.
+            self.panel.set_startup_id(token or "")
+            panel_pos, thickness = plasma_panel()
+            self.panel.popup_from_tray(panel_pos, thickness)
+
+    def _open_main(self, token=None):
+        if token:
+            self.ctl.gapp.win.set_startup_id(token)
+        self.open_main()
+
     def _click(self, _icon, x, y, button, _time, panel_pos):
         if button == 1:
             if self.panel.get_visible():
@@ -1215,11 +1370,17 @@ class Tray:
         pct = s["battery"]
         ok = s["link"] == "ok" and pct is not None
         text = f"{pct}%" if ok else ""
-        tip = (f"BlackShark V2 Pro · {pct}%" + (" (charging)" if s["charging"] else "")) if ok \
-            else "BlackShark V2 Pro · not connected"
+        detail = (f"{pct}%" + (" · charging" if s["charging"] else "")) if ok \
+            else "Not connected"
+        tip = f"BlackShark V2 Pro · {detail}"
         name = "battery-full-charging" if ok and s["charging"] else (
             "battery-low" if ok and pct <= LOW_BATTERY else "audio-headset")
-        if self.icon:
+        if self.sni:
+            overlay = ("battery-full-charging" if s["charging"] else
+                       "battery-low" if ok and pct <= LOW_BATTERY else "")
+            self.sni.set_state("audio-headset", overlay if ok else "",
+                               "BlackShark V2 Pro", detail)
+        elif self.icon:
             self.icon.set_label(text)
             self.icon.set_tooltip_text(tip)
             self.icon.set_icon_name(name)
@@ -1251,7 +1412,7 @@ class GApp(Gtk.Application):
             self.ctl.add_view(self.panel)
             self.tray = Tray(self.ctl, self.panel, self.show_main, self.quit)
             self.ctl.add_view(self.tray)
-            if self.tray_only and (self.tray.icon or self.tray.ind):
+            if self.tray_only and self.tray.available:
                 return
         self.show_main()
 
@@ -1264,7 +1425,7 @@ class GApp(Gtk.Application):
     def window_closed(self):
         if self.win.meter.proc:
             self.win._toggle_test(None)
-        if not (self.tray.icon or self.tray.ind):
+        if not self.tray.available:
             self.quit()
 
 
